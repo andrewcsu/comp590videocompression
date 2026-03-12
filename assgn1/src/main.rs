@@ -18,6 +18,92 @@ use toy_ac::symbol_model::VectorCountSymbolModel;
 
 use ffmpeg_sidecar::event::StreamTypeSpecificData::Video;
 
+const NUM_CONTEXTS: usize = 64;
+
+/// Temporal MED predictor.
+/// Applies the Median Edge Detector to temporal differences of causal neighbors
+/// (left, top, top-left). MED is edge-adaptive: at horizontal edges it uses the
+/// top temporal diff, at vertical edges it uses the left temporal diff, and in
+/// smooth regions it uses the gradient (left + top - top_left).
+fn temporal_med_predict(decoded_current: &[u8], prior_frame: &[u8], width: u32, r: u32, c: u32) -> u8 {
+    let prior_val = prior_frame[(r * width + c) as usize] as i32;
+
+    let left_tdiff = if c > 0 {
+        let idx = (r * width + c - 1) as usize;
+        decoded_current[idx] as i32 - prior_frame[idx] as i32
+    } else {
+        0
+    };
+
+    let top_tdiff = if r > 0 {
+        let idx = ((r - 1) * width + c) as usize;
+        decoded_current[idx] as i32 - prior_frame[idx] as i32
+    } else {
+        0
+    };
+
+    let tl_tdiff = if r > 0 && c > 0 {
+        let idx = ((r - 1) * width + c - 1) as usize;
+        decoded_current[idx] as i32 - prior_frame[idx] as i32
+    } else {
+        0
+    };
+
+    // MED: median of (left_tdiff, top_tdiff, left_tdiff + top_tdiff - tl_tdiff)
+    let combined = left_tdiff + top_tdiff - tl_tdiff;
+    let adjustment = if tl_tdiff >= left_tdiff.max(top_tdiff) {
+        left_tdiff.min(top_tdiff)
+    } else if tl_tdiff <= left_tdiff.min(top_tdiff) {
+        left_tdiff.max(top_tdiff)
+    } else {
+        combined
+    };
+
+    (prior_val + adjustment).clamp(0, 255) as u8
+}
+
+/// Compute local temporal activity from left and top neighbors.
+/// Returns (left_activity, top_activity) as quantized bin indices.
+/// Used together for 2D context selection: left_bin * 8 + top_bin = 0..63.
+fn activity_bins(decoded_current: &[u8], prior_frame: &[u8], width: u32, r: u32, c: u32) -> usize {
+    let left_abs = if c > 0 {
+        let idx = (r * width + c - 1) as usize;
+        (decoded_current[idx] as i32 - prior_frame[idx] as i32).unsigned_abs() as u8
+    } else {
+        0
+    };
+
+    let top_abs = if r > 0 {
+        let idx = ((r - 1) * width + c) as usize;
+        (decoded_current[idx] as i32 - prior_frame[idx] as i32).unsigned_abs() as u8
+    } else {
+        0
+    };
+
+    let left_bin = quantize8(left_abs);
+    let top_bin = quantize8(top_abs);
+    left_bin * 8 + top_bin
+}
+
+/// Quantize an absolute difference (0..255) into one of 8 bins.
+fn quantize8(val: u8) -> usize {
+    match val {
+        0..=1 => 0,
+        2..=3 => 1,
+        4..=7 => 2,
+        8..=15 => 3,
+        16..=31 => 4,
+        32..=63 => 5,
+        64..=127 => 6,
+        _ => 7,
+    }
+}
+
+/// Convert a mod-256 residual to signed [-128, 127].
+fn to_signed(residual: i32) -> i32 {
+    if residual > 127 { residual - 256 } else { residual }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Make sure ffmpeg is installed
     ffmpeg_sidecar::download::auto_download().unwrap();
@@ -105,8 +191,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut enc = Encoder::new();
 
-    // Set up arithmetic coding context(s)
-    let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
+    // Set up arithmetic coding contexts (64 contexts: 8 left bins x 8 top bins)
+    let mut contexts: Vec<VectorCountSymbolModel<i32>> = (0..NUM_CONTEXTS)
+        .map(|_| VectorCountSymbolModel::new((0..=255).collect()))
+        .collect();
+
+    // Bias correction: track average signed prediction error per context
+    let mut bias_sum = [0i32; NUM_CONTEXTS];
+    let mut bias_count = [0i32; NUM_CONTEXTS];
 
     // Process frames
     for frame in iter.filter_frames() {
@@ -124,17 +216,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 for c in 0..width {
                     let pixel_index = (r * width + c) as usize;
 
-                    // Encode difference with same pixel in prior frame.
-                    // Normalize and modulate difference to 8-bit range.
-                    let pixel_difference = (((current_frame[pixel_index] as i32)
-                        - (prior_frame[pixel_index] as i32))
-                        + 256)
-                        % 256;
+                    // Gradient-adjusted temporal predictor
+                    let base_pred = temporal_med_predict(&current_frame, &prior_frame, width, r, c) as i32;
 
-                    enc.encode(&pixel_difference, &pixel_difference_pdf, &mut bw);
+                    // Select context based on 2D local activity (left x top)
+                    let ctx = activity_bins(&current_frame, &prior_frame, width, r, c);
 
-                    // Update context
-                    pixel_difference_pdf.incr_count(&pixel_difference);
+                    // Apply bias correction to prediction
+                    let correction = if bias_count[ctx] > 0 { bias_sum[ctx] / bias_count[ctx] } else { 0 };
+                    let adjusted_pred = (base_pred + correction).clamp(0, 255);
+
+                    // Compute residual (mod 256 for lossless)
+                    let pixel_difference = ((current_frame[pixel_index] as i32 - adjusted_pred) + 256) % 256;
+
+                    enc.encode(&pixel_difference, &contexts[ctx], &mut bw);
+                    contexts[ctx].incr_count(&pixel_difference);
+
+                    // Update bias tracking
+                    let signed_res = to_signed(pixel_difference);
+                    bias_sum[ctx] += signed_res;
+                    bias_count[ctx] += 1;
+                    if bias_count[ctx] >= 256 {
+                        bias_sum[ctx] /= 2;
+                        bias_count[ctx] /= 2;
+                    }
                 }
             }
 
@@ -178,7 +283,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let mut dec = Decoder::new();
 
-        let mut pixel_difference_pdf = VectorCountSymbolModel::new((0..=255).collect());
+        let mut contexts: Vec<VectorCountSymbolModel<i32>> = (0..NUM_CONTEXTS)
+            .map(|_| VectorCountSymbolModel::new((0..=255).collect()))
+            .collect();
+
+        let mut bias_sum = [0i32; NUM_CONTEXTS];
+        let mut bias_count = [0i32; NUM_CONTEXTS];
 
         // Set up initial prior frame as uniform medium gray
         let mut prior_frame = vec![128 as u8; (width * height) as usize];
@@ -192,14 +302,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let current_frame: Vec<u8> = frame.data; // <- raw pixel y values
 
+                // Reconstruct decoded frame pixel by pixel
+                let mut decoded_frame = vec![0u8; (width * height) as usize];
+
                 // Process pixels in row major order.
                 for r in 0..height {
                     for c in 0..width {
                         let pixel_index = (r * width + c) as usize;
-                        let decoded_pixel_difference = dec.decode(&pixel_difference_pdf, &mut br).to_owned();
-                        pixel_difference_pdf.incr_count(&decoded_pixel_difference);
 
-                        let pixel_value = (prior_frame[pixel_index] as i32 + decoded_pixel_difference) % 256;
+                        // Same gradient-adjusted predictor (using decoded_frame for causal neighbors)
+                        let base_pred = temporal_med_predict(&decoded_frame, &prior_frame, width, r, c) as i32;
+
+                        // Same 2D context selection
+                        let ctx = activity_bins(&decoded_frame, &prior_frame, width, r, c);
+
+                        // Same bias correction
+                        let correction = if bias_count[ctx] > 0 { bias_sum[ctx] / bias_count[ctx] } else { 0 };
+                        let adjusted_pred = (base_pred + correction).clamp(0, 255);
+
+                        let decoded_pixel_difference = dec.decode(&contexts[ctx], &mut br).to_owned();
+                        contexts[ctx].incr_count(&decoded_pixel_difference);
+
+                        let pixel_value = (adjusted_pred + decoded_pixel_difference + 256) % 256;
+                        decoded_frame[pixel_index] = pixel_value as u8;
+
+                        // Update bias (same as encoder)
+                        let signed_res = to_signed(decoded_pixel_difference);
+                        bias_sum[ctx] += signed_res;
+                        bias_count[ctx] += 1;
+                        if bias_count[ctx] >= 256 {
+                            bias_sum[ctx] /= 2;
+                            bias_count[ctx] /= 2;
+                        }
 
                         if pixel_value != current_frame[pixel_index] as i32 {
                             println!(
